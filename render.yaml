@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: early-shift-public
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run public_lite_dashboard.py --server.port $PORT --server.address 0.0.0.0
+    envVars:
+      - key: DB_PATH
+        value: early_shift_demo.db
+      - key: PYTHON_VERSION
+        value: 3.11.6
