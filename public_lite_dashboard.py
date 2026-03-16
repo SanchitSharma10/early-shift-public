@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
 
 from public_app_helpers import (
@@ -268,29 +267,28 @@ with proof_col1:
     if timeline_df.empty:
         st.info("No recent detection timeline available.")
     else:
-        figure = go.Figure()
-        figure.add_bar(
-            x=timeline_df["detected_day"],
-            y=timeline_df["detections"],
-            name="Detections",
-            marker_color="#8fb8a7",
+        chart_df = timeline_df.copy()
+        chart_df["detected_day"] = pd.to_datetime(chart_df["detected_day"])
+        st.bar_chart(
+            chart_df.set_index("detected_day")["detections"],
+            color="#8fb8a7",
         )
-        figure.add_scatter(
-            x=timeline_df["detected_day"],
-            y=timeline_df["median_growth"],
-            name="Median growth %",
-            yaxis="y2",
-            mode="lines+markers",
-            line=dict(color="#c06d3d", width=3),
+        st.caption("Recent detection counts by day")
+        st.dataframe(
+            chart_df.rename(
+                columns={
+                    "detected_day": "Day",
+                    "detections": "Detections",
+                    "median_growth": "Median Growth",
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Detections": st.column_config.NumberColumn(format="%d"),
+                "Median Growth": st.column_config.NumberColumn(format="+%.1f%%"),
+            },
         )
-        figure.update_layout(
-            height=320,
-            margin=dict(l=10, r=10, t=10, b=10),
-            yaxis=dict(title="Detections"),
-            yaxis2=dict(title="Median growth %", overlaying="y", side="right"),
-            legend=dict(orientation="h", y=1.08, x=0),
-        )
-        st.plotly_chart(figure, use_container_width=True)
 
 with proof_col2:
     if recent_df.empty:
