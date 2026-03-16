@@ -12,6 +12,8 @@ Can be called from frontend as a simple API endpoint.
 import asyncio
 import aiohttp
 import os
+import shutil
+import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
@@ -28,13 +30,18 @@ def _resolve_default_db_path() -> Path:
     project_root = Path(__file__).parent
     primary_db = project_root / "early_shift.db"
     if primary_db.exists():
+        src = primary_db
+    elif (project_root / "early_shift_demo.db").exists():
+        src = project_root / "early_shift_demo.db"
+    else:
         return primary_db
 
-    demo_db = project_root / "early_shift_demo.db"
-    if demo_db.exists():
-        return demo_db
-
-    return primary_db
+    # Copy to a writable location so DuckDB can create lock/WAL files
+    # (Streamlit Cloud mounts the repo read-only).
+    tmp_dest = Path(tempfile.gettempdir()) / src.name
+    if not tmp_dest.exists():
+        shutil.copy2(src, tmp_dest)
+    return tmp_dest
 
 
 DB_PATH = _resolve_default_db_path()

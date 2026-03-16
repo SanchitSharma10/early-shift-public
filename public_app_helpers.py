@@ -7,6 +7,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import shutil
+import tempfile
+
 import pandas as pd
 
 from check_my_game import get_game_ccu_status, search_youtube_for_game
@@ -21,10 +24,16 @@ def _resolve_public_db_path() -> str:
     project_root = Path(__file__).parent
     demo_db = project_root / "early_shift_demo.db"
     if demo_db.exists():
-        return str(demo_db)
+        src = demo_db
+    else:
+        src = project_root / "early_shift.db"
 
-    primary_db = project_root / "early_shift.db"
-    return str(primary_db)
+    # Copy to a writable location so DuckDB can create lock/WAL files
+    # (Streamlit Cloud mounts the repo read-only).
+    tmp_dest = Path(tempfile.gettempdir()) / src.name
+    if not tmp_dest.exists():
+        shutil.copy2(src, tmp_dest)
+    return str(tmp_dest)
 
 
 DB_PATH = _resolve_public_db_path()
