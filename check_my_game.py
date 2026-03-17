@@ -100,38 +100,40 @@ def get_game_ccu_status(game_name: str) -> dict:
     result = db.execute("""
         WITH latest AS (SELECT MAX(timestamp) as max_ts FROM games),
         current AS (
-            SELECT name, ccu, timestamp
+            SELECT universe_id, name, ccu, timestamp
             FROM games g, latest l
             WHERE g.timestamp >= l.max_ts - INTERVAL 1 HOUR
         ),
         baseline AS (
-            SELECT name, AVG(ccu) as avg_ccu
+            SELECT universe_id, AVG(ccu) as avg_ccu
             FROM games g, latest l
             WHERE g.timestamp BETWEEN l.max_ts - INTERVAL 3 DAY AND l.max_ts - INTERVAL 2 DAY
-            GROUP BY name
+            GROUP BY universe_id
         )
         SELECT 
+            c.universe_id,
             c.name,
             c.ccu as current_ccu,
             b.avg_ccu as baseline_ccu,
             ROUND((c.ccu - b.avg_ccu) / NULLIF(b.avg_ccu, 0) * 100, 1) as growth_pct
         FROM current c
-        LEFT JOIN baseline b ON c.name = b.name
+        LEFT JOIN baseline b ON c.universe_id = b.universe_id
         WHERE LOWER(c.name) LIKE LOWER(?)
         ORDER BY c.ccu DESC
         LIMIT 1
     """, [f"%{game_name}%"]).fetchone()
     
     if not result:
-        return {"found": False, "game_name": game_name}
+        return {"found": False, "game_name": game_name, "universe_id": None}
     
     return {
         "found": True,
-        "game_name": result[0],
-        "current_ccu": result[1],
-        "baseline_ccu": result[2],
-        "growth_pct": result[3],
-        "is_growing": result[3] and result[3] > 25,
+        "universe_id": result[0],
+        "game_name": result[1],
+        "current_ccu": result[2],
+        "baseline_ccu": result[3],
+        "growth_pct": result[4],
+        "is_growing": result[4] and result[4] > 25,
     }
 
 

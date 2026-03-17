@@ -201,8 +201,10 @@ with tool_col:
                 st.metric("Growth", f"{growth_value:+.1f}%")
 
         if ccu.get("found"):
+            universe_id = ccu.get("universe_id")
             st.caption(
                 f"Matched game: {clean_label(ccu.get('game_name'))} | "
+                f"Universe ID: {universe_id if universe_id is not None else 'N/A'} | "
                 f"Current CCU: {int(ccu.get('current_ccu') or 0):,}"
             )
         else:
