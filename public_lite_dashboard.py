@@ -204,6 +204,7 @@ with tool_col:
                 st.metric("Growth", "N/A")
             else:
                 st.metric("Growth", f"{growth_value:+.1f}%")
+        st.caption("Based on recent matching creator coverage volume, not total CCU.")
 
         if ccu.get("found"):
             universe_id = ccu.get("universe_id")
@@ -217,7 +218,13 @@ with tool_col:
 
         st.info(result["recommendation"])
 
-        if result["videos"]:
+        if not result.get("youtube_lookup_ok"):
+            lookup_error = result.get("youtube_lookup_error") or "lookup_failed"
+            if lookup_error == "missing_api_key":
+                st.warning("Live YouTube lookup is not configured in this deployment.")
+            else:
+                st.warning("Recent YouTube coverage could not be fetched right now. A 0-video reading may reflect lookup failure rather than true zero coverage.")
+        elif result["videos"]:
             with st.expander("Recent creator coverage", expanded=True):
                 for video in result["videos"][:5]:
                     st.markdown(f"**{video['title']}**")

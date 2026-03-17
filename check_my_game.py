@@ -46,10 +46,10 @@ DB_PATH = _resolve_default_db_path()
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 
 
-async def search_youtube_for_game(game_name: str, max_results: int = 10) -> list:
+async def search_youtube_for_game(game_name: str, max_results: int = 10) -> dict:
     """Search YouTube for recent videos about a game."""
     if not YOUTUBE_API_KEY:
-        return []
+        return {"ok": False, "videos": [], "error": "missing_api_key"}
     
     published_after = datetime.utcnow() - timedelta(hours=72)  # Last 3 days
     query = f"{game_name} roblox"
@@ -70,12 +70,13 @@ async def search_youtube_for_game(game_name: str, max_results: int = 10) -> list
         try:
             with urlopen(request_url, timeout=10) as response:
                 if response.status != 200:
-                    return {}
-                return json.load(response)
+                    return {"ok": False, "payload": {}, "error": f"http_{response.status}"}
+                return {"ok": True, "payload": json.load(response), "error": None}
         except Exception:
-            return {}
+            return {"ok": False, "payload": {}, "error": "request_failed"}
 
-    data = await asyncio.to_thread(_fetch_json)
+    fetch_result = await asyncio.to_thread(_fetch_json)
+    data = fetch_result.get("payload", {})
     
     videos = []
     for item in data.get("items", []):
@@ -89,7 +90,11 @@ async def search_youtube_for_game(game_name: str, max_results: int = 10) -> list
             "thumbnail": snippet.get("thumbnails", {}).get("medium", {}).get("url"),
         })
     
-    return videos
+    return {
+        "ok": bool(fetch_result.get("ok")),
+        "videos": videos,
+        "error": fetch_result.get("error"),
+    }
 
 
 def get_game_ccu_status(game_name: str | None = None, universe_id: str | int | None = None) -> dict:
@@ -159,7 +164,8 @@ async def check_my_game(game_name: str, universe_id: str | int | None = None) ->
     
     # Search YouTube
     youtube_query = ccu_status.get("game_name") or game_name
-    videos = await search_youtube_for_game(youtube_query)
+    youtube_result = await search_youtube_for_game(youtube_query)
+    videos = youtube_result["videos"]
     
     # Determine signal strength
     video_count = len(videos)
@@ -197,6 +203,8 @@ async def check_my_game(game_name: str, universe_id: str | int | None = None) ->
             "signal_strength": signal,
             "signal_emoji": signal_emoji,
             "videos": videos[:5],  # Top 5 for display
+            "lookup_ok": youtube_result["ok"],
+            "lookup_error": youtube_result["error"],
         },
         
         # Overall Assessment

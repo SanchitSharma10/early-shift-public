@@ -290,6 +290,8 @@ def run_public_game_check(game_name: str = "", universe_id: str = "", max_result
             "video_count": 0,
             "signal": "NONE",
             "signal_emoji": "*",
+            "youtube_lookup_ok": False,
+            "youtube_lookup_error": "missing_query",
             "recommendation": "Enter a Roblox game to inspect creator coverage and current momentum.",
         }
 
@@ -297,12 +299,17 @@ def run_public_game_check(game_name: str = "", universe_id: str = "", max_result
     loop = asyncio.new_event_loop()
     try:
         youtube_query = ccu_status.get("game_name") or normalized_name
-        videos = loop.run_until_complete(search_youtube_for_game(youtube_query, max_results=max_results))
+        youtube_result = loop.run_until_complete(search_youtube_for_game(youtube_query, max_results=max_results))
     finally:
         loop.close()
 
+    videos = youtube_result["videos"]
     video_count = len(videos)
-    if video_count >= 8:
+    youtube_lookup_ok = bool(youtube_result.get("ok"))
+    youtube_lookup_error = youtube_result.get("error")
+    if not youtube_lookup_ok:
+        signal, signal_emoji = "UNAVAILABLE", "?"
+    elif video_count >= 8:
         signal, signal_emoji = "STRONG", "+++"
     elif video_count >= 3:
         signal, signal_emoji = "MEDIUM", "++"
@@ -311,7 +318,9 @@ def run_public_game_check(game_name: str = "", universe_id: str = "", max_result
     else:
         signal, signal_emoji = "NONE", "-"
 
-    if ccu_status.get("is_growing") and video_count >= 5:
+    if not youtube_lookup_ok:
+        recommendation = "Creator coverage lookup is unavailable right now. Treat this as a CCU-only readout until YouTube search recovers."
+    elif ccu_status.get("is_growing") and video_count >= 5:
         recommendation = "High momentum: creator coverage is active and CCU is already moving."
     elif ccu_status.get("is_growing") and video_count >= 1:
         recommendation = "Growing with coverage: worth checking for a partnership or timing window."
@@ -335,5 +344,7 @@ def run_public_game_check(game_name: str = "", universe_id: str = "", max_result
         "video_count": video_count,
         "signal": signal,
         "signal_emoji": signal_emoji,
+        "youtube_lookup_ok": youtube_lookup_ok,
+        "youtube_lookup_error": youtube_lookup_error,
         "recommendation": recommendation,
     }
