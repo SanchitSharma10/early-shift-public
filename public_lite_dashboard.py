@@ -190,7 +190,7 @@ with tool_col:
 
         metric_col1, metric_col2, metric_col3 = st.columns(3)
         with metric_col1:
-            st.metric("YouTube signal", f"{result['signal_emoji']} {result['signal']}")
+            st.metric("YouTube signal", result["signal"])
         with metric_col2:
             st.metric("Videos (72h)", result["video_count"])
         with metric_col3:
@@ -258,7 +258,7 @@ else:
 st.markdown("---")
 
 st.subheader("Detection proof")
-timeline_df = timeline_cached(days=14)
+timeline_df = timeline_cached(days=45)
 recent_df = recent_detections_cached(limit=10)
 
 proof_col1, proof_col2 = st.columns([1.1, 1.2], gap="large")
@@ -272,6 +272,8 @@ with proof_col1:
         st.bar_chart(
             chart_df.set_index("detected_day")["detections"],
             color="#8fb8a7",
+            use_container_width=True,
+            height=280,
         )
         st.caption("Recent detection counts by day")
         st.dataframe(
