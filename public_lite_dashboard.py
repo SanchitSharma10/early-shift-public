@@ -188,7 +188,7 @@ with tool_col:
         result = game_check_cached(game_name.strip())
         ccu = result["ccu"]
 
-        metric_col1, metric_col2, metric_col3 = st.columns(3)
+        metric_col1, metric_col2, metric_col3 = st.columns([2, 1, 2])
         with metric_col1:
             st.metric("YouTube signal", result["signal"])
         with metric_col2:
