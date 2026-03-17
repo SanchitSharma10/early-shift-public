@@ -92,12 +92,13 @@ async def search_youtube_for_game(game_name: str, max_results: int = 10) -> list
     return videos
 
 
-def get_game_ccu_status(game_name: str) -> dict:
+def get_game_ccu_status(game_name: str | None = None, universe_id: str | int | None = None) -> dict:
     """Get CCU and growth status for a specific game."""
     db = duckdb.connect(str(DB_PATH), read_only=True)
-    
-    # Fuzzy match game name
-    result = db.execute("""
+    normalized_name = (game_name or "").strip()
+    normalized_universe = str(universe_id).strip() if universe_id is not None else ""
+
+    base_query = """
         WITH latest AS (SELECT MAX(timestamp) as max_ts FROM games),
         current AS (
             SELECT universe_id, name, ccu, timestamp
@@ -118,13 +119,23 @@ def get_game_ccu_status(game_name: str) -> dict:
             ROUND((c.ccu - b.avg_ccu) / NULLIF(b.avg_ccu, 0) * 100, 1) as growth_pct
         FROM current c
         LEFT JOIN baseline b ON c.universe_id = b.universe_id
-        WHERE LOWER(c.name) LIKE LOWER(?)
         ORDER BY c.ccu DESC
         LIMIT 1
-    """, [f"%{game_name}%"]).fetchone()
+    """
+
+    if normalized_universe:
+        result = db.execute(
+            base_query.replace("ORDER BY c.ccu DESC", "WHERE CAST(c.universe_id AS VARCHAR) = ? ORDER BY c.ccu DESC"),
+            [normalized_universe],
+        ).fetchone()
+    else:
+        result = db.execute(
+            base_query.replace("ORDER BY c.ccu DESC", "WHERE LOWER(c.name) LIKE LOWER(?) ORDER BY c.ccu DESC"),
+            [f"%{normalized_name}%"],
+        ).fetchone()
     
     if not result:
-        return {"found": False, "game_name": game_name, "universe_id": None}
+        return {"found": False, "game_name": game_name or "", "universe_id": None}
     
     return {
         "found": True,
@@ -137,17 +148,18 @@ def get_game_ccu_status(game_name: str) -> dict:
     }
 
 
-async def check_my_game(game_name: str) -> dict:
+async def check_my_game(game_name: str, universe_id: str | int | None = None) -> dict:
     """
     Main function: Check a game's status and YouTube coverage.
     
     Returns structured data ready for frontend display.
     """
     # Get CCU status
-    ccu_status = get_game_ccu_status(game_name)
+    ccu_status = get_game_ccu_status(game_name, universe_id=universe_id)
     
     # Search YouTube
-    videos = await search_youtube_for_game(game_name)
+    youtube_query = ccu_status.get("game_name") or game_name
+    videos = await search_youtube_for_game(youtube_query)
     
     # Determine signal strength
     video_count = len(videos)

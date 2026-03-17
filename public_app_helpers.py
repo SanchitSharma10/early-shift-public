@@ -279,9 +279,10 @@ def load_public_case_studies(limit: int = 3) -> pd.DataFrame:
     return frame
 
 
-def run_public_game_check(game_name: str, max_results: int = 5) -> dict[str, Any]:
+def run_public_game_check(game_name: str = "", universe_id: str = "", max_results: int = 5) -> dict[str, Any]:
     normalized_name = game_name.strip()
-    if not normalized_name:
+    normalized_universe = universe_id.strip()
+    if not normalized_name and not normalized_universe:
         return {
             "query": "",
             "ccu": {"found": False, "game_name": "", "current_ccu": None, "baseline_ccu": None, "growth_pct": None, "is_growing": False},
@@ -292,10 +293,11 @@ def run_public_game_check(game_name: str, max_results: int = 5) -> dict[str, Any
             "recommendation": "Enter a Roblox game to inspect creator coverage and current momentum.",
         }
 
-    ccu_status = get_game_ccu_status(normalized_name)
+    ccu_status = get_game_ccu_status(normalized_name, universe_id=normalized_universe or None)
     loop = asyncio.new_event_loop()
     try:
-        videos = loop.run_until_complete(search_youtube_for_game(normalized_name, max_results=max_results))
+        youtube_query = ccu_status.get("game_name") or normalized_name
+        videos = loop.run_until_complete(search_youtube_for_game(youtube_query, max_results=max_results))
     finally:
         loop.close()
 
@@ -327,6 +329,7 @@ def run_public_game_check(game_name: str, max_results: int = 5) -> dict[str, Any
 
     return {
         "query": normalized_name,
+        "universe_query": normalized_universe,
         "ccu": ccu_status,
         "videos": videos,
         "video_count": video_count,

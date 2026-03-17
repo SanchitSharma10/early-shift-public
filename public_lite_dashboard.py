@@ -41,8 +41,8 @@ def case_studies_cached(limit: int) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=120)
-def game_check_cached(game_name: str) -> dict:
-    return run_public_game_check(game_name)
+def game_check_cached(game_name: str, universe_id: str) -> dict:
+    return run_public_game_check(game_name, universe_id=universe_id)
 
 
 st.set_page_config(
@@ -180,12 +180,17 @@ with tool_col:
         game_name = st.text_input(
             "Game name",
             placeholder="Dress To Impress",
-            help="Search the local CCU database plus the last 72 hours of YouTube coverage.",
+            help="Fuzzy-match a Roblox game name in the local CCU snapshot.",
+        )
+        universe_id = st.text_input(
+            "Universe ID (optional)",
+            placeholder="5203828273",
+            help="Use this for an exact Roblox universe lookup.",
         )
         submitted = st.form_submit_button("Run check", use_container_width=True, type="primary")
 
-    if submitted and game_name.strip():
-        result = game_check_cached(game_name.strip())
+    if submitted and (game_name.strip() or universe_id.strip()):
+        result = game_check_cached(game_name.strip(), universe_id.strip())
         ccu = result["ccu"]
 
         metric_col1, metric_col2, metric_col3 = st.columns([2, 1, 2])
@@ -222,7 +227,7 @@ with tool_col:
         else:
             st.caption("No matching YouTube videos found in the last 72 hours.")
     else:
-        st.caption("Use this to turn the analytics stack into a plain-English signal for one game.")
+        st.caption("Enter either a game name or a universe ID to turn the analytics stack into a plain-English signal.")
 
 st.markdown("---")
 
