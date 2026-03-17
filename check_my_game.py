@@ -10,12 +10,13 @@ Can be called from frontend as a simple API endpoint.
 """
 
 import asyncio
-import aiohttp
 import os
 import shutil
 import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlencode
+from urllib.request import urlopen
 from dotenv import load_dotenv
 import duckdb
 import json
@@ -66,12 +67,18 @@ async def search_youtube_for_game(game_name: str, max_results: int = 10) -> list
         "order": "date",
         "publishedAfter": published_after.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
-    
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, params=params) as resp:
-            if resp.status != 200:
-                return []
-            data = await resp.json()
+
+    def _fetch_json() -> dict:
+        request_url = f"{url}?{urlencode(params)}"
+        try:
+            with urlopen(request_url, timeout=10) as response:
+                if response.status != 200:
+                    return {}
+                return json.load(response)
+        except Exception:
+            return {}
+
+    data = await asyncio.to_thread(_fetch_json)
     
     videos = []
     for item in data.get("items", []):
