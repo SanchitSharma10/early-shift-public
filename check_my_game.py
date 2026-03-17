@@ -17,11 +17,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlencode
 from urllib.request import urlopen
-from dotenv import load_dotenv
 import duckdb
 import json
-
-load_dotenv()
 
 def _resolve_default_db_path() -> Path:
     env_path = os.getenv("DB_PATH")
