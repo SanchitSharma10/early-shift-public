@@ -5,13 +5,10 @@ import streamlit as st
 
 from public_app_helpers import (
     clean_label,
+    load_correlation_evidence,
     get_public_snapshot,
-    load_detection_timeline,
-    load_public_case_studies,
-    load_public_creator_signals,
-    load_public_recent_detections,
+    load_public_top_spikes,
     run_public_game_check,
-    time_ago,
 )
 
 
@@ -21,23 +18,13 @@ def snapshot_cached() -> dict:
 
 
 @st.cache_data(ttl=300)
-def creator_signals_cached(limit: int) -> pd.DataFrame:
-    return load_public_creator_signals(limit=limit)
+def correlation_evidence_cached(limit: int, recent_days: int, lead_days: int) -> dict:
+    return load_correlation_evidence(limit=limit, recent_days=recent_days, lead_days=lead_days)
 
 
 @st.cache_data(ttl=300)
-def recent_detections_cached(limit: int) -> pd.DataFrame:
-    return load_public_recent_detections(limit=limit)
-
-
-@st.cache_data(ttl=300)
-def timeline_cached(days: int) -> pd.DataFrame:
-    return load_detection_timeline(days=days)
-
-
-@st.cache_data(ttl=300)
-def case_studies_cached(limit: int) -> pd.DataFrame:
-    return load_public_case_studies(limit=limit)
+def top_spikes_cached(limit: int, recent_days: int) -> pd.DataFrame:
+    return load_public_top_spikes(limit=limit, recent_days=recent_days)
 
 
 @st.cache_data(ttl=120)
@@ -107,6 +94,8 @@ st.markdown(
 )
 
 snapshot = snapshot_cached()
+evidence = correlation_evidence_cached(limit=5, recent_days=7, lead_days=30)
+top_spikes_df = top_spikes_cached(limit=10, recent_days=7)
 
 st.markdown(
     f"""
@@ -132,49 +121,87 @@ with stats_col3:
 with stats_col4:
     st.metric("Retention profiles", f"{int(snapshot['retention_profiles']):,}")
 
-intro_col, tool_col = st.columns([1.35, 1.0], gap="large")
+st.markdown("---")
 
-with intro_col:
-    st.subheader("What this public view shows")
-    card_col1, card_col2, card_col3 = st.columns(3)
-    with card_col1:
-        st.markdown(
-            """
-            <div class="mini-card">
-                <h4>Creator impact</h4>
-                <p>Which channels repeatedly show up before a lift, how broad their reach is, and how quickly the lift lands.</p>
-            </div>
-            """,
-            unsafe_allow_html=True,
+st.subheader("Correlation evidence")
+st.caption(
+    "Public proof layer: recent top spikes aligned against creator upload timing and downstream lift. "
+    "Hour 0 is the detected lift. Mention index is derived from creator publish timestamps inside detected spike events."
+)
+
+evidence_col1, evidence_col2 = st.columns(2, gap="large")
+
+with evidence_col1:
+    overlay_df = evidence["overlay"]
+    if overlay_df.empty:
+        st.info("Not enough recent spike evidence to build the overlay.")
+    else:
+        chart_df = overlay_df.set_index("Hour vs detection")
+        st.line_chart(
+            chart_df,
+            color=["#1c5d4f", "#ff4d4f"],
+            use_container_width=True,
+            height=300,
         )
-    with card_col2:
-        st.markdown(
-            """
-            <div class="mini-card">
-                <h4>Detection proof</h4>
-                <p>Recent creator-linked spikes, median lag from upload to lift, and whether the spike looks sticky or disposable.</p>
-            </div>
-            """,
-            unsafe_allow_html=True,
+        top_spike_names = ", ".join(evidence["top_spikes"]["game_name"].head(5).tolist())
+        st.caption(f"Top recent spikes in this evidence set: {top_spike_names}")
+
+with evidence_col2:
+    lead_hist_df = evidence["lead_histogram"]
+    if lead_hist_df.empty:
+        st.info("Lead-time histogram is unavailable for the current public sample.")
+    else:
+        st.bar_chart(
+            lead_hist_df.set_index("Lead window")["Spikes"],
+            color="#8fb8a7",
+            use_container_width=True,
+            height=300,
         )
-    with card_col3:
-        st.markdown(
-            """
-            <div class="mini-card">
-                <h4>Studio wedge</h4>
-                <p>A quick game check that turns the analytics stack into a simple recommendation a developer can use immediately.</p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        median_lead_hours = evidence.get("median_lead_hours")
+        if median_lead_hours is not None:
+            st.caption(
+                f"Median lead time to local peak: {median_lead_hours:.1f}h "
+                f"(n={evidence['lead_samples']})"
+            )
+
+st.markdown("---")
+
+panel_col1, panel_col2 = st.columns([1.1, 0.9], gap="large")
+
+with panel_col1:
+    st.subheader("Top this-week spikes")
     st.caption(
-        "Latest CCU snapshot: "
-        f"{snapshot['last_ccu_at']:%Y-%m-%d %H:%M UTC} | "
-        "Latest creator-linked spike in this DB: "
-        f"{snapshot['last_spike_at']:%Y-%m-%d %H:%M UTC}"
+        "Best creator-linked lifts from the latest week in the dataset. "
+        "Flow overlap % = share of snapshot intervals from creator upload to detected lift where CCU was still rising."
     )
+    if top_spikes_df.empty:
+        st.info("No recent creator-linked spikes available.")
+    else:
+        st.dataframe(
+            top_spikes_df.rename(
+                columns={
+                    "game_name": "Game",
+                    "channel_title": "Creator",
+                    "growth_percent": "Growth",
+                    "current_ccu": "CCU",
+                    "flow_overlap_pct": "Flow overlap %",
+                    "stickiness_pct": "Stickiness",
+                    "lag_hours": "Lag (h)",
+                    "detected_at": "Detected",
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Growth": st.column_config.NumberColumn(format="+%.1f%%"),
+                "CCU": st.column_config.NumberColumn(format="%,d"),
+                "Flow overlap %": st.column_config.NumberColumn(format="%.1f%%"),
+                "Stickiness": st.column_config.NumberColumn(format="%.1f%%"),
+                "Lag (h)": st.column_config.NumberColumn(format="%.1f"),
+            },
+        )
 
-with tool_col:
+with panel_col2:
     st.subheader("Check a Roblox game")
     with st.form("game-check-form", clear_on_submit=False):
         game_name = st.text_input(
@@ -207,10 +234,10 @@ with tool_col:
         st.caption("Based on recent matching creator coverage volume, not total CCU.")
 
         if ccu.get("found"):
-            universe_id = ccu.get("universe_id")
+            matched_universe_id = ccu.get("universe_id")
             st.caption(
                 f"Matched game: {clean_label(ccu.get('game_name'))} | "
-                f"Universe ID: {universe_id if universe_id is not None else 'N/A'} | "
+                f"Universe ID: {matched_universe_id if matched_universe_id is not None else 'N/A'} | "
                 f"Current CCU: {int(ccu.get('current_ccu') or 0):,}"
             )
         else:
@@ -235,140 +262,3 @@ with tool_col:
             st.caption("No matching YouTube videos found in the last 72 hours.")
     else:
         st.caption("Enter either a game name or a universe ID to turn the analytics stack into a plain-English signal.")
-
-st.markdown("---")
-
-st.subheader("Creator impact")
-st.caption("The creators below repeatedly appear before lift, not just once.")
-
-creator_df = creator_signals_cached(limit=10)
-if creator_df.empty:
-    st.info("Not enough creator-linked detections yet to populate this view.")
-else:
-    st.dataframe(
-        creator_df.rename(
-            columns={
-                "creator": "Creator",
-                "spike_detections": "Detections",
-                "spike_videos": "Spike Videos",
-                "games_covered": "Games",
-                "median_growth": "Median Growth",
-                "hit_rate_pct": "Hit Rate",
-                "median_lag_hours": "Median Lag (h)",
-            }
-        ),
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Detections": st.column_config.NumberColumn(format="%d"),
-            "Spike Videos": st.column_config.NumberColumn(format="%d"),
-            "Games": st.column_config.NumberColumn(format="%d"),
-            "Median Growth": st.column_config.NumberColumn(format="+%.1f%%"),
-            "Hit Rate": st.column_config.NumberColumn(format="%.1f%%"),
-            "Median Lag (h)": st.column_config.NumberColumn(format="%.1f"),
-        },
-    )
-
-st.markdown("---")
-
-st.subheader("Detection proof")
-timeline_df = timeline_cached(days=45)
-recent_df = recent_detections_cached(limit=10)
-
-proof_col1, proof_col2 = st.columns([1.1, 1.2], gap="large")
-
-with proof_col1:
-    if timeline_df.empty:
-        st.info("No recent detection timeline available.")
-    else:
-        chart_df = timeline_df.copy()
-        chart_df["detected_day"] = pd.to_datetime(chart_df["detected_day"])
-        st.bar_chart(
-            chart_df.set_index("detected_day")["detections"],
-            color="#8fb8a7",
-            use_container_width=True,
-            height=280,
-        )
-        st.caption("Recent detection counts by day")
-        st.dataframe(
-            chart_df.rename(
-                columns={
-                    "detected_day": "Day",
-                    "detections": "Detections",
-                    "median_growth": "Median Growth",
-                }
-            ),
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Detections": st.column_config.NumberColumn(format="%d"),
-                "Median Growth": st.column_config.NumberColumn(format="+%.1f%%"),
-            },
-        )
-
-with proof_col2:
-    if recent_df.empty:
-        st.info("No recent creator-linked detections available.")
-    else:
-        recent_view = recent_df.copy()
-        recent_view["detected_at"] = recent_view["detected_at"].apply(time_ago)
-        st.dataframe(
-            recent_view.rename(
-                columns={
-                    "game_name": "Game",
-                    "channel_title": "Creator",
-                    "growth_percent": "Growth",
-                    "current_ccu": "CCU",
-                    "stickiness_pct": "Stickiness",
-                    "decay_days": "Decay Days",
-                    "lag_hours": "Lag (h)",
-                    "detected_at": "Detected",
-                    "video_url": "Video",
-                }
-            ),
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Growth": st.column_config.NumberColumn(format="+%.1f%%"),
-                "CCU": st.column_config.NumberColumn(format="%,d"),
-                "Stickiness": st.column_config.NumberColumn(format="%.1f%%"),
-                "Decay Days": st.column_config.NumberColumn(format="%.1f"),
-                "Lag (h)": st.column_config.NumberColumn(format="%.1f"),
-                "Video": st.column_config.LinkColumn(display_text="Watch"),
-            },
-        )
-
-st.markdown("---")
-
-st.subheader("Case studies")
-st.caption("Three compact examples pulled from the current local snapshot.")
-
-case_df = case_studies_cached(limit=3)
-case_columns = st.columns(3, gap="large")
-
-if case_df.empty:
-    st.info("No case studies available yet.")
-else:
-    for column, row in zip(case_columns, case_df.itertuples(index=False), strict=False):
-        with column:
-            st.markdown(
-                f"""
-                <div class="mini-card">
-                    <h4>{row.game_name}</h4>
-                    <p>
-                        <strong>Standout creator:</strong> {row.standout_creator}<br>
-                        <strong>Peak growth at detection:</strong> +{row.max_growth:.1f}%<br>
-                        <strong>Current CCU at detection:</strong> {int(row.current_ccu):,}<br>
-                        <strong>Creator videos linked:</strong> {int(row.creator_videos)} across {int(row.creators)} creators<br>
-                        <strong>Stickiness:</strong> {row.stickiness_pct if row.stickiness_pct is not None else 'N/A'}<br>
-                        <strong>Decay days:</strong> {row.decay_days if row.decay_days is not None else 'N/A'}
-                    </p>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            if row.standout_mechanic and row.standout_mechanic != "-":
-                st.caption(f"Example mechanic signal: {row.standout_mechanic}")
-            st.caption(
-                f"Window: {row.first_detected_at:%Y-%m-%d} to {row.last_detected_at:%Y-%m-%d}"
-            )

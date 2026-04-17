@@ -213,6 +213,323 @@ def load_detection_timeline(days: int = 14) -> pd.DataFrame:
     return _query_dataframe(query)
 
 
+def load_correlation_evidence(limit: int = 5, recent_days: int = 7, lead_days: int = 30) -> dict[str, Any]:
+    recent_days = max(int(recent_days), 1)
+    lead_days = max(int(lead_days), 1)
+
+    top_spikes_query = f"""
+        WITH latest AS (
+            SELECT MAX(detected_at) AS max_detected_at
+            FROM mechanic_spikes
+        ),
+        ranked AS (
+            SELECT
+                ms.universe_id,
+                ms.game_name,
+                ms.detected_at,
+                ms.published_at,
+                ms.growth_percent,
+                ms.current_ccu,
+                ms.video_count,
+                ROW_NUMBER() OVER (
+                    PARTITION BY ms.universe_id
+                    ORDER BY ms.growth_percent DESC, ms.detected_at DESC
+                ) AS row_num
+            FROM mechanic_spikes ms, latest
+            WHERE ms.detected_at >= latest.max_detected_at - INTERVAL {recent_days} DAY
+        )
+        SELECT
+            universe_id,
+            game_name,
+            detected_at,
+            published_at,
+            ROUND(growth_percent, 1) AS growth_percent,
+            current_ccu,
+            COALESCE(video_count, 1.0) AS video_count
+        FROM ranked
+        WHERE row_num = 1
+        ORDER BY growth_percent DESC, current_ccu DESC
+        LIMIT ?
+    """
+    top_spikes = _query_dataframe(top_spikes_query, (limit,))
+    if top_spikes.empty:
+        return {
+            "overlay": pd.DataFrame(),
+            "lead_histogram": pd.DataFrame(),
+            "top_spikes": pd.DataFrame(),
+            "median_lead_hours": None,
+            "lead_samples": 0,
+        }
+
+    top_spikes["game_name"] = top_spikes["game_name"].map(clean_label)
+    top_spikes["detected_at"] = pd.to_datetime(top_spikes["detected_at"], utc=True)
+    top_spikes["published_at"] = pd.to_datetime(top_spikes["published_at"], utc=True)
+
+    universe_ids = ",".join(str(int(value)) for value in top_spikes["universe_id"].dropna().unique())
+    min_published = top_spikes["published_at"].min()
+    max_detected = top_spikes["detected_at"].max()
+    snapshot_query = f"""
+        SELECT universe_id, name, timestamp, ccu
+        FROM games
+        WHERE universe_id IN ({universe_ids})
+          AND timestamp >= ?
+          AND timestamp <= ?
+        ORDER BY universe_id, timestamp
+    """
+    snapshots = _query_dataframe(
+        snapshot_query,
+        (
+            min_published.to_pydatetime() - pd.Timedelta(hours=48),
+            max_detected.to_pydatetime() + pd.Timedelta(hours=24),
+        ),
+    )
+    if not snapshots.empty:
+        snapshots["timestamp"] = pd.to_datetime(snapshots["timestamp"], utc=True)
+
+    velocity_rows: list[dict[str, Any]] = []
+    mention_rows: list[dict[str, Any]] = []
+    for row in top_spikes.itertuples(index=False):
+        spike_snapshots = snapshots.loc[snapshots["universe_id"] == row.universe_id].copy()
+        if spike_snapshots.empty:
+            continue
+        spike_snapshots = spike_snapshots.loc[
+            (spike_snapshots["timestamp"] >= row.detected_at - pd.Timedelta(hours=48))
+            & (spike_snapshots["timestamp"] <= row.detected_at + pd.Timedelta(hours=24))
+        ].sort_values("timestamp")
+        if len(spike_snapshots) >= 2:
+            previous_ccu = spike_snapshots["ccu"].shift(1)
+            delta_hours = (
+                spike_snapshots["timestamp"].diff().dt.total_seconds() / 3600.0
+            )
+            velocity_pct = (
+                (spike_snapshots["ccu"] - previous_ccu)
+                / previous_ccu.where(previous_ccu > 0)
+                * 100.0
+            ) / delta_hours.where(delta_hours > 0)
+            spike_snapshots["relative_hour"] = (
+                (spike_snapshots["timestamp"] - row.detected_at).dt.total_seconds() / 3600.0
+            ).round().astype("Int64")
+            spike_snapshots["velocity_pct"] = velocity_pct
+            valid_points = spike_snapshots.dropna(subset=["relative_hour", "velocity_pct"])
+            valid_points = valid_points.loc[
+                (valid_points["relative_hour"] >= -48)
+                & (valid_points["relative_hour"] <= 24)
+            ]
+            for point in valid_points.itertuples(index=False):
+                velocity_rows.append(
+                    {
+                        "relative_hour": int(point.relative_hour),
+                        "velocity_pct": max(float(point.velocity_pct), 0.0),
+                    }
+                )
+
+        mention_hour = int(round((row.published_at - row.detected_at).total_seconds() / 3600.0))
+        if -48 <= mention_hour <= 24:
+            mention_rows.append(
+                {
+                    "relative_hour": mention_hour,
+                    "mention_weight": float(row.video_count or 1.0),
+                }
+            )
+
+    hour_index = pd.DataFrame({"relative_hour": list(range(-48, 25))})
+    velocity_frame = pd.DataFrame(velocity_rows)
+    mention_frame = pd.DataFrame(mention_rows)
+
+    if velocity_frame.empty:
+        velocity_summary = hour_index.assign(avg_velocity_pct=0.0)
+    else:
+        velocity_summary = (
+            velocity_frame.groupby("relative_hour", as_index=False)["velocity_pct"]
+            .mean()
+            .rename(columns={"velocity_pct": "avg_velocity_pct"})
+        )
+
+    if mention_frame.empty:
+        mention_summary = hour_index.assign(mention_weight=0.0)
+    else:
+        mention_summary = (
+            mention_frame.groupby("relative_hour", as_index=False)["mention_weight"]
+            .sum()
+        )
+
+    overlay = (
+        hour_index.merge(velocity_summary, on="relative_hour", how="left")
+        .merge(mention_summary, on="relative_hour", how="left")
+        .fillna({"avg_velocity_pct": 0.0, "mention_weight": 0.0})
+    )
+    velocity_scale = float(overlay["avg_velocity_pct"].max() or 0.0)
+    mention_scale = float(overlay["mention_weight"].max() or 0.0)
+    overlay["CCU velocity index"] = (
+        overlay["avg_velocity_pct"] / velocity_scale * 100.0 if velocity_scale > 0 else 0.0
+    )
+    overlay["Creator mention index"] = (
+        overlay["mention_weight"] / mention_scale * 100.0 if mention_scale > 0 else 0.0
+    )
+    overlay["Hour vs detection"] = overlay["relative_hour"].astype(int)
+    overlay = overlay[["Hour vs detection", "CCU velocity index", "Creator mention index"]]
+
+    lead_query = f"""
+        WITH latest AS (
+            SELECT MAX(detected_at) AS max_detected_at
+            FROM mechanic_spikes
+        ),
+        spikes AS (
+            SELECT universe_id, detected_at, current_ccu
+            FROM mechanic_spikes, latest
+            WHERE detected_at >= latest.max_detected_at - INTERVAL {lead_days} DAY
+        ),
+        lead AS (
+            SELECT
+                s.universe_id,
+                s.detected_at,
+                s.current_ccu,
+                ARG_MAX(g.timestamp, g.ccu) AS peak_time,
+                MAX(g.ccu) AS peak_ccu
+            FROM spikes s
+            JOIN games g
+              ON g.universe_id = s.universe_id
+             AND g.timestamp >= s.detected_at
+             AND g.timestamp <= s.detected_at + INTERVAL '7' DAY
+            GROUP BY s.universe_id, s.detected_at, s.current_ccu
+        )
+        SELECT
+            EXTRACT(EPOCH FROM (peak_time - detected_at)) / 3600.0 AS lead_hours
+        FROM lead
+        WHERE peak_time IS NOT NULL
+    """
+    lead_frame = _query_dataframe(lead_query)
+    if lead_frame.empty:
+        lead_histogram = pd.DataFrame(columns=["Lead window", "Spikes"])
+        median_lead_hours = None
+    else:
+        lead_hours = pd.to_numeric(lead_frame["lead_hours"], errors="coerce").dropna()
+        if lead_hours.empty:
+            lead_histogram = pd.DataFrame(columns=["Lead window", "Spikes"])
+            median_lead_hours = None
+        else:
+            bins = [-0.01, 6, 12, 24, 48, 72, float("inf")]
+            labels = ["0-6h", "6-12h", "12-24h", "24-48h", "48-72h", "72h+"]
+            histogram = pd.cut(lead_hours, bins=bins, labels=labels)
+            lead_histogram = (
+                histogram.value_counts(sort=False)
+                .rename_axis("Lead window")
+                .reset_index(name="Spikes")
+            )
+            median_lead_hours = float(lead_hours.median())
+
+    return {
+        "overlay": overlay,
+        "lead_histogram": lead_histogram,
+        "top_spikes": top_spikes,
+        "median_lead_hours": median_lead_hours,
+        "lead_samples": int(len(lead_frame)),
+    }
+
+
+def load_public_top_spikes(limit: int = 10, recent_days: int = 7) -> pd.DataFrame:
+    recent_days = max(int(recent_days), 1)
+    retention_join = (
+        "LEFT JOIN game_retention_metrics grm ON grm.universe_id = ranked.universe_id"
+        if _table_exists("game_retention_metrics")
+        else ""
+    )
+    stickiness_select = (
+        "ROUND(grm.stickiness_index * 100.0, 1) AS stickiness_pct,"
+        if _table_exists("game_retention_metrics")
+        else "NULL AS stickiness_pct,"
+    )
+    query = f"""
+        WITH latest AS (
+            SELECT MAX(detected_at) AS max_detected_at
+            FROM mechanic_spikes
+        ),
+        ranked AS (
+            SELECT
+                ms.universe_id,
+                ms.game_name,
+                ms.channel_title,
+                ROUND(ms.growth_percent, 1) AS growth_percent,
+                ms.current_ccu,
+                ROUND(EXTRACT(EPOCH FROM (ms.detected_at - ms.published_at)) / 3600.0, 1) AS lag_hours,
+                ms.detected_at,
+                ms.published_at,
+                ROW_NUMBER() OVER (
+                    PARTITION BY ms.universe_id
+                    ORDER BY ms.growth_percent DESC, ms.detected_at DESC
+                ) AS row_num
+            FROM mechanic_spikes ms, latest
+            WHERE ms.detected_at >= latest.max_detected_at - INTERVAL {recent_days} DAY
+        )
+        SELECT
+            ranked.universe_id,
+            ranked.game_name,
+            ranked.channel_title,
+            ranked.growth_percent,
+            ranked.current_ccu,
+            {stickiness_select}
+            ranked.lag_hours,
+            ranked.detected_at,
+            ranked.published_at
+        FROM ranked
+        {retention_join}
+        WHERE ranked.row_num = 1
+        ORDER BY ranked.growth_percent DESC, ranked.current_ccu DESC
+        LIMIT ?
+    """
+    frame = _query_dataframe(query, (limit,))
+    if frame.empty:
+        return frame
+
+    frame["game_name"] = frame["game_name"].map(clean_label)
+    frame["detected_at"] = pd.to_datetime(frame["detected_at"], utc=True)
+    frame["published_at"] = pd.to_datetime(frame["published_at"], utc=True)
+
+    universe_ids = ",".join(str(int(value)) for value in frame["universe_id"].dropna().unique())
+    min_published = frame["published_at"].min()
+    max_detected = frame["detected_at"].max()
+    snapshots_query = f"""
+        SELECT universe_id, timestamp, ccu
+        FROM games
+        WHERE universe_id IN ({universe_ids})
+          AND timestamp >= ?
+          AND timestamp <= ?
+        ORDER BY universe_id, timestamp
+    """
+    snapshots = _query_dataframe(
+        snapshots_query,
+        (
+            min_published.to_pydatetime() - pd.Timedelta(hours=1),
+            max_detected.to_pydatetime() + pd.Timedelta(hours=1),
+        ),
+    )
+    if not snapshots.empty:
+        snapshots["timestamp"] = pd.to_datetime(snapshots["timestamp"], utc=True)
+
+    overlap_values: list[float | None] = []
+    for row in frame.itertuples(index=False):
+        spike_snapshots = snapshots.loc[
+            (snapshots["universe_id"] == row.universe_id)
+            & (snapshots["timestamp"] >= row.published_at)
+            & (snapshots["timestamp"] <= row.detected_at)
+        ].copy()
+        if len(spike_snapshots) < 2:
+            overlap_values.append(None)
+            continue
+        spike_snapshots = spike_snapshots.sort_values("timestamp")
+        previous_ccu = spike_snapshots["ccu"].shift(1)
+        delta_ccu = spike_snapshots["ccu"] - previous_ccu
+        valid = delta_ccu.dropna()
+        if valid.empty:
+            overlap_values.append(None)
+        else:
+            overlap_values.append(round(float((valid > 0).mean() * 100.0), 1))
+
+    frame["flow_overlap_pct"] = overlap_values
+    frame["detected_at"] = frame["detected_at"].apply(time_ago)
+    return frame
+
+
 def load_public_case_studies(limit: int = 3) -> pd.DataFrame:
     retention_join = (
         "LEFT JOIN game_retention_metrics grm ON grm.universe_id = grouped.universe_id"
