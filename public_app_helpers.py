@@ -31,7 +31,11 @@ def _resolve_public_db_path() -> str:
     # Copy to a writable location so DuckDB can create lock/WAL files
     # (Streamlit Cloud mounts the repo read-only).
     tmp_dest = Path(tempfile.gettempdir()) / src.name
-    if not tmp_dest.exists():
+    if (
+        not tmp_dest.exists()
+        or src.stat().st_mtime > tmp_dest.stat().st_mtime
+        or src.stat().st_size != tmp_dest.stat().st_size
+    ):
         shutil.copy2(src, tmp_dest)
     return str(tmp_dest)
 
@@ -45,6 +49,77 @@ def _query_dataframe(query: str, params: tuple[Any, ...] = ()) -> pd.DataFrame:
         columns = [column[0] for column in result.description]
         rows = result.fetchall()
     return pd.DataFrame(rows, columns=columns)
+
+
+def _nearest_snapshot(frame: pd.DataFrame, target_time: pd.Timestamp, max_gap_hours: float = 1.5) -> pd.Series | None:
+    if frame.empty:
+        return None
+    candidate_frame = frame.copy()
+    candidate_frame["time_gap"] = (candidate_frame["timestamp"] - target_time).abs()
+    nearest = candidate_frame.sort_values("time_gap").iloc[0]
+    if nearest["time_gap"] > pd.Timedelta(hours=max_gap_hours):
+        return None
+    return nearest
+
+
+def _forward_peak_gain_pct(
+    frame: pd.DataFrame,
+    target_time: pd.Timestamp,
+    horizon_hours: float,
+    baseline_value: float | None = None,
+) -> float | None:
+    if frame.empty:
+        return None
+    local_frame = frame.copy()
+    local_frame["timestamp"] = pd.to_datetime(local_frame["timestamp"], utc=True)
+    window_end = target_time + pd.Timedelta(hours=horizon_hours)
+    future = local_frame.loc[
+        (local_frame["timestamp"] >= target_time) & (local_frame["timestamp"] <= window_end)
+    ].sort_values("timestamp")
+    if future.empty:
+        return None
+
+    if baseline_value is None:
+        baseline_row = _nearest_snapshot(local_frame, target_time)
+        if baseline_row is None:
+            return None
+        baseline_value = baseline_row["ccu"]
+
+    if baseline_value is None or baseline_value <= 0:
+        return None
+
+    peak_ccu = future["ccu"].max()
+    return round(float((peak_ccu - baseline_value) / baseline_value * 100.0), 1)
+
+
+def _forward_velocity_pct(
+    frame: pd.DataFrame,
+    target_time: pd.Timestamp,
+    horizon_hours: float = 6,
+    baseline_value: float | None = None,
+) -> float | None:
+    if frame.empty:
+        return None
+    local_frame = frame.copy()
+    local_frame["timestamp"] = pd.to_datetime(local_frame["timestamp"], utc=True)
+    window_end = target_time + pd.Timedelta(hours=horizon_hours)
+    future = local_frame.loc[
+        (local_frame["timestamp"] >= target_time) & (local_frame["timestamp"] <= window_end)
+    ].sort_values("timestamp")
+    if future.empty:
+        return None
+
+    if baseline_value is None:
+        baseline_row = _nearest_snapshot(local_frame, target_time)
+        if baseline_row is None:
+            return None
+        baseline_value = baseline_row["ccu"]
+
+    if baseline_value is None or baseline_value <= 0:
+        return None
+
+    last_ccu = future.iloc[-1]["ccu"]
+    return round(float((last_ccu - baseline_value) / baseline_value * 100.0), 1)
 
 
 def _table_exists(table_name: str) -> bool:
@@ -94,11 +169,47 @@ def get_public_snapshot() -> dict[str, Any]:
             (SELECT COUNT(*) FROM youtube_videos) AS youtube_videos,
             (SELECT COUNT(DISTINCT channel_id) FROM youtube_videos WHERE channel_id IS NOT NULL) AS tracked_channels,
             (SELECT COUNT(*) FROM mechanic_spikes) AS creator_linked_spikes,
+            (SELECT COUNT(*) FROM mechanic_spikes WHERE sustained_growth_72h IS NOT NULL) AS sustained_known,
+            (SELECT COUNT(*) FROM mechanic_spikes WHERE sustained_growth_72h = TRUE) AS sustained_true,
+            (
+                SELECT ROUND(
+                    100.0 * COUNT(*) FILTER (WHERE sustained_growth_72h = TRUE)
+                    / NULLIF(COUNT(*) FILTER (WHERE sustained_growth_72h IS NOT NULL), 0),
+                    1
+                )
+                FROM mechanic_spikes
+            ) AS sustained_rate_pct,
             {retention_count_expr},
             (SELECT MIN(timestamp) FROM games) AS first_ccu_at,
             (SELECT MAX(timestamp) FROM games) AS last_ccu_at,
             (SELECT MIN(detected_at) FROM mechanic_spikes) AS first_spike_at,
-            (SELECT MAX(detected_at) FROM mechanic_spikes) AS last_spike_at
+            (SELECT MAX(detected_at) FROM mechanic_spikes) AS last_spike_at,
+            (
+                WITH latest AS (
+                    SELECT MAX(detected_at) AS max_detected_at
+                    FROM mechanic_spikes
+                ),
+                spikes AS (
+                    SELECT universe_id, detected_at, current_ccu
+                    FROM mechanic_spikes, latest
+                    WHERE detected_at >= latest.max_detected_at - INTERVAL 30 DAY
+                ),
+                lead AS (
+                    SELECT
+                        s.universe_id,
+                        s.detected_at,
+                        ARG_MAX(g.timestamp, g.ccu) AS peak_time
+                    FROM spikes s
+                    JOIN games g
+                      ON g.universe_id = s.universe_id
+                     AND g.timestamp >= s.detected_at
+                     AND g.timestamp <= s.detected_at + INTERVAL '7' DAY
+                    GROUP BY s.universe_id, s.detected_at
+                )
+                SELECT ROUND(MEDIAN(EXTRACT(EPOCH FROM (peak_time - detected_at)) / 3600.0), 1)
+                FROM lead
+                WHERE peak_time IS NOT NULL
+            ) AS median_lead_hours
     """
     row = _query_dataframe(query).iloc[0].to_dict()
     return row
@@ -451,6 +562,7 @@ def load_public_top_spikes(limit: int = 10, recent_days: int = 7) -> pd.DataFram
                 ms.channel_title,
                 ROUND(ms.growth_percent, 1) AS growth_percent,
                 ms.current_ccu,
+                ms.sustained_growth_72h,
                 ROUND(EXTRACT(EPOCH FROM (ms.detected_at - ms.published_at)) / 3600.0, 1) AS lag_hours,
                 ms.detected_at,
                 ms.published_at,
@@ -467,6 +579,7 @@ def load_public_top_spikes(limit: int = 10, recent_days: int = 7) -> pd.DataFram
             ranked.channel_title,
             ranked.growth_percent,
             ranked.current_ccu,
+            ranked.sustained_growth_72h,
             {stickiness_select}
             ranked.lag_hours,
             ranked.detected_at,
@@ -500,25 +613,36 @@ def load_public_top_spikes(limit: int = 10, recent_days: int = 7) -> pd.DataFram
         snapshots_query,
         (
             min_published.to_pydatetime() - pd.Timedelta(hours=1),
-            max_detected.to_pydatetime() + pd.Timedelta(hours=1),
+            max_detected.to_pydatetime() + pd.Timedelta(hours=8),
         ),
     )
     if not snapshots.empty:
         snapshots["timestamp"] = pd.to_datetime(snapshots["timestamp"], utc=True)
 
     overlap_values: list[float | None] = []
+    velocity_values: list[float | None] = []
     for row in frame.itertuples(index=False):
         spike_snapshots = snapshots.loc[
             (snapshots["universe_id"] == row.universe_id)
             & (snapshots["timestamp"] >= row.published_at)
-            & (snapshots["timestamp"] <= row.detected_at)
+            & (snapshots["timestamp"] <= row.detected_at + pd.Timedelta(hours=8))
         ].copy()
-        if len(spike_snapshots) < 2:
+        baseline_value = row.current_ccu if row.current_ccu and row.current_ccu > 0 else None
+        velocity_values.append(
+            _forward_velocity_pct(
+                spike_snapshots,
+                row.detected_at,
+                horizon_hours=6,
+                baseline_value=baseline_value,
+            )
+        )
+        overlap_window = spike_snapshots.loc[spike_snapshots["timestamp"] <= row.detected_at].copy()
+        if len(overlap_window) < 2:
             overlap_values.append(None)
             continue
-        spike_snapshots = spike_snapshots.sort_values("timestamp")
-        previous_ccu = spike_snapshots["ccu"].shift(1)
-        delta_ccu = spike_snapshots["ccu"] - previous_ccu
+        overlap_window = overlap_window.sort_values("timestamp")
+        previous_ccu = overlap_window["ccu"].shift(1)
+        delta_ccu = overlap_window["ccu"] - previous_ccu
         valid = delta_ccu.dropna()
         if valid.empty:
             overlap_values.append(None)
@@ -526,8 +650,200 @@ def load_public_top_spikes(limit: int = 10, recent_days: int = 7) -> pd.DataFram
             overlap_values.append(round(float((valid > 0).mean() * 100.0), 1))
 
     frame["flow_overlap_pct"] = overlap_values
+    frame["ccu_velocity_6h_pct"] = velocity_values
+    frame["sustained_72h_label"] = frame["sustained_growth_72h"].map(
+        lambda value: "Yes" if value is True or value == 1 else ("No" if value is False or value == 0 else "N/A")
+    )
     frame["detected_at"] = frame["detected_at"].apply(time_ago)
     return frame
+
+
+def load_null_spike_baseline(limit: int = 3, recent_days: int = 7, controls_per_spike: int = 3) -> pd.DataFrame:
+    recent_days = max(int(recent_days), 1)
+    controls_per_spike = max(int(controls_per_spike), 1)
+    query = f"""
+        WITH latest AS (
+            SELECT MAX(detected_at) AS max_detected_at
+            FROM mechanic_spikes
+        ),
+        ranked AS (
+            SELECT
+                ms.universe_id,
+                ms.game_name,
+                ms.detected_at,
+                ms.current_ccu,
+                ms.growth_percent,
+                ROW_NUMBER() OVER (
+                    PARTITION BY ms.universe_id
+                    ORDER BY ms.growth_percent DESC, ms.detected_at DESC
+                ) AS row_num
+            FROM mechanic_spikes ms, latest
+            WHERE ms.detected_at >= latest.max_detected_at - INTERVAL {recent_days} DAY
+        )
+        SELECT
+            universe_id,
+            game_name,
+            detected_at,
+            current_ccu,
+            ROUND(growth_percent, 1) AS growth_percent
+        FROM ranked
+        WHERE row_num = 1
+        ORDER BY growth_percent DESC, current_ccu DESC
+        LIMIT ?
+    """
+    spike_frame = _query_dataframe(query, (limit,))
+    if spike_frame.empty:
+        return spike_frame
+
+    spike_frame["detected_at"] = pd.to_datetime(spike_frame["detected_at"], utc=True)
+    min_detected = spike_frame["detected_at"].min()
+    max_detected = spike_frame["detected_at"].max()
+
+    game_query = """
+        SELECT universe_id, name, timestamp, ccu
+        FROM games
+        WHERE timestamp >= ?
+          AND timestamp <= ?
+        ORDER BY universe_id, timestamp
+    """
+    all_games = _query_dataframe(
+        game_query,
+        (
+            min_detected.to_pydatetime() - pd.Timedelta(hours=2),
+            max_detected.to_pydatetime() + pd.Timedelta(hours=72),
+        ),
+    )
+    if all_games.empty:
+        return pd.DataFrame()
+
+    all_games["timestamp"] = pd.to_datetime(all_games["timestamp"], utc=True)
+    spike_universe_ids = set(
+        _query_dataframe("SELECT DISTINCT universe_id FROM mechanic_spikes")["universe_id"].dropna().astype(int)
+    )
+    control_games = all_games.loc[~all_games["universe_id"].isin(spike_universe_ids)].copy()
+    if control_games.empty:
+        return pd.DataFrame()
+
+    rows: list[dict[str, Any]] = []
+    for spike in spike_frame.itertuples(index=False):
+        spike_name = clean_label(spike.game_name)
+        baseline_value = float(spike.current_ccu or 0)
+        if baseline_value <= 0:
+            continue
+
+        detected_at = spike.detected_at
+        snapshot_window = control_games.loc[
+            (control_games["timestamp"] >= detected_at - pd.Timedelta(hours=1))
+            & (control_games["timestamp"] <= detected_at + pd.Timedelta(hours=1))
+        ].copy()
+        if snapshot_window.empty:
+            continue
+
+        nearest_candidates: list[dict[str, Any]] = []
+        for universe_id, group in snapshot_window.groupby("universe_id"):
+            nearest = _nearest_snapshot(group, detected_at)
+            if nearest is None:
+                continue
+            control_name = clean_label(nearest["name"])
+            if control_name == spike_name:
+                continue
+            nearest_candidates.append(
+                {
+                    "universe_id": int(universe_id),
+                    "name": control_name,
+                    "baseline_ccu": float(nearest["ccu"]),
+                    "ccu_gap": abs(float(nearest["ccu"]) - baseline_value),
+                }
+            )
+
+        if not nearest_candidates:
+            continue
+
+        control_candidate_frame = (
+            pd.DataFrame(nearest_candidates)
+            .sort_values(["ccu_gap", "baseline_ccu"])
+            .head(controls_per_spike)
+        )
+
+        spike_history = all_games.loc[all_games["universe_id"] == spike.universe_id].copy()
+        spike_velocity_6h = _forward_velocity_pct(
+            spike_history,
+            detected_at,
+            horizon_hours=6,
+            baseline_value=baseline_value,
+        )
+        spike_gain_24h = _forward_peak_gain_pct(
+            spike_history,
+            detected_at,
+            horizon_hours=24,
+            baseline_value=baseline_value,
+        )
+        spike_gain_72h = _forward_peak_gain_pct(
+            spike_history,
+            detected_at,
+            horizon_hours=72,
+            baseline_value=baseline_value,
+        )
+
+        control_velocity_values: list[float] = []
+        control_gain_24h_values: list[float] = []
+        control_gain_72h_values: list[float] = []
+        control_names: list[str] = []
+        for control in control_candidate_frame.itertuples(index=False):
+            control_names.append(str(control.name))
+            control_history = all_games.loc[all_games["universe_id"] == control.universe_id].copy()
+            velocity_value = _forward_velocity_pct(
+                control_history,
+                detected_at,
+                horizon_hours=6,
+                baseline_value=float(control.baseline_ccu),
+            )
+            gain_24h_value = _forward_peak_gain_pct(
+                control_history,
+                detected_at,
+                horizon_hours=24,
+                baseline_value=float(control.baseline_ccu),
+            )
+            gain_72h_value = _forward_peak_gain_pct(
+                control_history,
+                detected_at,
+                horizon_hours=72,
+                baseline_value=float(control.baseline_ccu),
+            )
+            if velocity_value is not None:
+                control_velocity_values.append(velocity_value)
+            if gain_24h_value is not None:
+                control_gain_24h_values.append(gain_24h_value)
+            if gain_72h_value is not None:
+                control_gain_72h_values.append(gain_72h_value)
+
+        if not control_names:
+            continue
+
+        control_velocity = round(float(pd.Series(control_velocity_values).median()), 1) if control_velocity_values else None
+        control_gain_24h = round(float(pd.Series(control_gain_24h_values).median()), 1) if control_gain_24h_values else None
+        control_gain_72h = round(float(pd.Series(control_gain_72h_values).median()), 1) if control_gain_72h_values else None
+
+        rows.append(
+            {
+                "Game": clean_label(spike.game_name),
+                "Baseline CCU": int(baseline_value),
+                "Spike velocity 6h": spike_velocity_6h,
+                "Control velocity 6h": control_velocity,
+                "Spike peak 24h": spike_gain_24h,
+                "Control peak 24h": control_gain_24h,
+                "Spike peak 72h": spike_gain_72h,
+                "Control peak 72h": control_gain_72h,
+                "72h edge": (
+                    round(float(spike_gain_72h - control_gain_72h), 1)
+                    if spike_gain_72h is not None and control_gain_72h is not None
+                    else None
+                ),
+                "Matched controls": ", ".join(control_names),
+            }
+        )
+
+    return pd.DataFrame(rows)
 
 
 def load_public_case_studies(limit: int = 3) -> pd.DataFrame:

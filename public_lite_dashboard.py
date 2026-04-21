@@ -6,6 +6,7 @@ import streamlit as st
 from public_app_helpers import (
     clean_label,
     load_correlation_evidence,
+    load_null_spike_baseline,
     get_public_snapshot,
     load_public_top_spikes,
     run_public_game_check,
@@ -25,6 +26,15 @@ def correlation_evidence_cached(limit: int, recent_days: int, lead_days: int) ->
 @st.cache_data(ttl=300)
 def top_spikes_cached(limit: int, recent_days: int) -> pd.DataFrame:
     return load_public_top_spikes(limit=limit, recent_days=recent_days)
+
+
+@st.cache_data(ttl=300)
+def null_spike_baseline_cached(limit: int, recent_days: int, controls_per_spike: int) -> pd.DataFrame:
+    return load_null_spike_baseline(
+        limit=limit,
+        recent_days=recent_days,
+        controls_per_spike=controls_per_spike,
+    )
 
 
 @st.cache_data(ttl=120)
@@ -96,6 +106,7 @@ st.markdown(
 snapshot = snapshot_cached()
 evidence = correlation_evidence_cached(limit=5, recent_days=7, lead_days=30)
 top_spikes_df = top_spikes_cached(limit=10, recent_days=7)
+null_baseline_df = null_spike_baseline_cached(limit=3, recent_days=7, controls_per_spike=3)
 
 st.markdown(
     f"""
@@ -119,7 +130,22 @@ with stats_col2:
 with stats_col3:
     st.metric("Creator-linked detections", f"{int(snapshot['creator_linked_spikes']):,}")
 with stats_col4:
-    st.metric("Retention profiles", f"{int(snapshot['retention_profiles']):,}")
+    sustained_rate = snapshot.get("sustained_rate_pct")
+    sustained_known = int(snapshot.get("sustained_known") or 0)
+    if sustained_rate is None:
+        st.metric("Sustained 72h+", "N/A")
+    else:
+        st.metric("Sustained 72h+", f"{sustained_rate:.1f}%")
+
+metrics_note_parts = []
+if snapshot.get("median_lead_hours") is not None:
+    metrics_note_parts.append(f"Median lead to peak: {float(snapshot['median_lead_hours']):.1f}h")
+if sustained_known:
+    metrics_note_parts.append(
+        f"Sustained sample: {int(snapshot.get('sustained_true') or 0)}/{sustained_known}"
+    )
+if metrics_note_parts:
+    st.caption(" | ".join(metrics_note_parts))
 
 st.markdown("---")
 
@@ -164,6 +190,31 @@ with evidence_col2:
                 f"(n={evidence['lead_samples']})"
             )
 
+st.subheader("Null-spike baseline")
+st.caption(
+    "Same-week spikes matched against non-spike games with similar baseline CCU at the same timestamp. "
+    "This is a rough falsification layer: if the spike does not beat the matched control set, the lift is less convincing. "
+    "Controls are matched by baseline CCU only in the public demo."
+)
+if null_baseline_df.empty:
+    st.info("Not enough non-spike control data to build the baseline table.")
+else:
+    st.dataframe(
+        null_baseline_df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Baseline CCU": st.column_config.NumberColumn(format="%,d"),
+            "Spike velocity 6h": st.column_config.NumberColumn(format="+%.1f%%"),
+            "Control velocity 6h": st.column_config.NumberColumn(format="+%.1f%%"),
+            "Spike peak 24h": st.column_config.NumberColumn(format="+%.1f%%"),
+            "Control peak 24h": st.column_config.NumberColumn(format="+%.1f%%"),
+            "Spike peak 72h": st.column_config.NumberColumn(format="+%.1f%%"),
+            "Control peak 72h": st.column_config.NumberColumn(format="+%.1f%%"),
+            "72h edge": st.column_config.NumberColumn(format="+%.1f%%"),
+        },
+    )
+
 st.markdown("---")
 
 panel_col1, panel_col2 = st.columns([1.1, 0.9], gap="large")
@@ -172,6 +223,7 @@ with panel_col1:
     st.subheader("Top this-week spikes")
     st.caption(
         "Best creator-linked lifts from the latest week in the dataset. "
+        "CCU velocity 6h = forward CCU change in the first six hours after detection. "
         "Flow overlap % = share of snapshot intervals from creator upload to detected lift where CCU was still rising."
     )
     if top_spikes_df.empty:
@@ -184,7 +236,9 @@ with panel_col1:
                     "channel_title": "Creator",
                     "growth_percent": "Growth",
                     "current_ccu": "CCU",
+                    "ccu_velocity_6h_pct": "CCU velocity 6h",
                     "flow_overlap_pct": "Flow overlap %",
+                    "sustained_72h_label": "Sustained 72h",
                     "stickiness_pct": "Stickiness",
                     "lag_hours": "Lag (h)",
                     "detected_at": "Detected",
@@ -195,7 +249,9 @@ with panel_col1:
             column_config={
                 "Growth": st.column_config.NumberColumn(format="+%.1f%%"),
                 "CCU": st.column_config.NumberColumn(format="%,d"),
+                "CCU velocity 6h": st.column_config.NumberColumn(format="+%.1f%%"),
                 "Flow overlap %": st.column_config.NumberColumn(format="%.1f%%"),
+                "Sustained 72h": st.column_config.TextColumn(),
                 "Stickiness": st.column_config.NumberColumn(format="%.1f%%"),
                 "Lag (h)": st.column_config.NumberColumn(format="%.1f"),
             },

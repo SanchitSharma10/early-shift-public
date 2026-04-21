@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 *.db
 !early_shift_demo.db
+.claude/
+*.db.wal
+*.db.tmp
